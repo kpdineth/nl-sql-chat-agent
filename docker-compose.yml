@@ -1,0 +1,123 @@
+# docker-compose.yml
+# NL-SQL Chat System — 5 containers: Database + MCP Server + ngrok + Chat Server + MCP tester
+#
+# HOW IT WORKS:
+#   Browser :3000  -->  Chat Server  -->  Claude API (internet)  -->  ngrok tunnel  -->  MCP Server :8000  -->  Database
+#   You type here       Forwards msg      AI thinks                  public URL           Runs queries          Your data
+#
+# QUICK START:
+#   1. Copy .env.example to .env and fill in your API keys
+#   2. docker compose up --build
+#   3. Open http://localhost:3000
+
+services:
+
+  # --- DATABASE (PostgreSQL 16) ---
+  db:
+    image: postgres:16
+    container_name: nl_sql_db
+    restart: unless-stopped
+
+    environment:
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: secret123
+      POSTGRES_DB: shopdb
+
+    ports:
+      - "5433:5432"
+
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./init-scripts:/docker-entrypoint-initdb.d
+
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U admin -d shopdb"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # --- MCP SERVER (AI-callable tools + report generation) ---
+  mcp-server:
+    build:
+      context: .
+      dockerfile: Dockerfile.mcp
+    container_name: mcp_sql_server
+    restart: unless-stopped
+
+    environment:
+      DATABASE_URL_READONLY: postgresql://readonly_user:readonly123@db:5432/shopdb
+      FASTMCP_SERVER_HOST: "0.0.0.0"    # Listen on ALL interfaces (not just localhost)
+      FASTMCP_SERVER_PORT: "8000"        # Port inside the container
+
+    ports:
+      - "8086:8000"            # MCP SSE endpoint → http://localhost:8086
+
+    volumes:
+      - reports_data:/app/reports     # Shared reports folder
+
+    depends_on:
+      db:
+        condition: service_healthy
+
+  # --- NGROK TUNNEL (exposes MCP server to the internet) ---
+  # Claude API (Anthropic's cloud) needs to reach your MCP server.
+  # ngrok creates a public URL that tunnels to mcp-server inside Docker.
+  ngrok:
+    image: ngrok/ngrok:latest
+    container_name: ngrok_tunnel
+    restart: unless-stopped
+
+    environment:
+      NGROK_AUTHTOKEN: ${NGROK_AUTHTOKEN}
+
+    # Tunnel to mcp-server on its internal Docker port
+    command: http mcp-server:8000 --log stdout
+
+    ports:
+      - "4040:4040"             # ngrok dashboard → http://localhost:4040
+
+    depends_on:
+      - mcp-server
+
+  # --- CHAT SERVER (HTML interface + Claude API + serves reports) ---
+  chat-server:
+    build:
+      context: .
+      dockerfile: Dockerfile.chat
+    container_name: ai_chat_server
+    restart: unless-stopped
+
+    # Load ALL env vars from .env file (API key, MCP URL, etc.)
+    env_file:
+      - .env
+
+    environment:
+      # Chat server auto-discovers ngrok URL from ngrok's API
+      NGROK_API_URL: http://ngrok:4040
+
+    ports:
+      - "3000:3000"             # Chat UI → http://localhost:3000
+
+    volumes:
+      - reports_data:/app/reports     # Same shared reports folder
+
+    depends_on:
+      - mcp-server
+      - ngrok
+
+  # --- TEST CLIENT for MCP Server ---
+  test-mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile.mcp-test
+    container_name: mcp_test_client
+
+    environment:
+      MCP_SERVER_URL: http://mcp-server:8000
+
+    depends_on:
+      - mcp-server
+
+volumes:
+  pgdata:
+  reports_data:          # Shared between mcp-server and chat-server

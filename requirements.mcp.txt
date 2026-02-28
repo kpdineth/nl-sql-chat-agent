@@ -1,0 +1,9 @@
+# requirements.mcp.txt
+# Packages needed for the MCP server container
+
+mcp[cli]
+asyncpg==0.30.0
+python-dotenv==1.0.1
+pydantic>=2.0
+uvicorn[standard]
+reportlab>=4.0

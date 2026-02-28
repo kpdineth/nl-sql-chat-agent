@@ -1,0 +1,7 @@
+FROM python:3.12-slim
+WORKDIR /app
+COPY requirements_chat.txt .
+RUN pip install --no-cache-dir -r requirements_chat.txt
+COPY chat_server.py .
+COPY .env .
+CMD ["python", "chat_server.py"]

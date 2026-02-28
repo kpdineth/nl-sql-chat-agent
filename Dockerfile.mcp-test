@@ -1,0 +1,13 @@
+# Dockerfile.mcp-test
+# Test client that connects to the MCP server and calls its tools
+
+FROM python:3.12-slim
+
+WORKDIR /app
+
+# Install MCP client + helpers
+RUN pip install --no-cache-dir mcp[cli] colorama requests
+
+COPY test_mcp.py .
+
+CMD ["python", "test_mcp.py"]

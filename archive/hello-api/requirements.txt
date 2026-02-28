@@ -1,0 +1,9 @@
+# requirements.txt
+# List of Python packages our app needs
+# Docker will install these inside the container using: pip install -r requirements.txt
+
+colorama==0.4.6
+asyncpg==0.30.0
+python-dotenv==1.0.1
+fastapi==0.115.6
+uvicorn[standard]==0.34.0

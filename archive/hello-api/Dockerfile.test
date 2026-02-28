@@ -1,0 +1,13 @@
+# Dockerfile.test
+# A SEPARATE container that tests the API by calling it over HTTP
+
+FROM python:3.12-slim
+
+WORKDIR /app
+
+# This container only needs requests and colorama (no database stuff)
+RUN pip install --no-cache-dir requests colorama
+
+COPY test_api.py .
+
+CMD ["python", "test_api.py"]
