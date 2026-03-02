@@ -1,7 +1,7 @@
 # mcp_server.py
-# MCP Server — exposes database tools + code execution + PDF/HTML generation
+# MCP Server — exposes database tools + code execution + PDF/HTML generation + self-extending tools
 #
-#   TOOLS AVAILABLE:
+#   TOOLS AVAILABLE (14 total):
 #
 #   DATABASE:
 #     db_health_check      Check database connection
@@ -12,12 +12,17 @@
 #     db_get_schema        See table structures + sample data
 #
 #   CODE EXECUTION:
-#     execute_analysis     Run Python code on full dataset
+#     execute_analysis     Run Python code on full dataset (no restrictions)
 #
 #   REPORT GENERATION:
 #     create_pdf_report    Create a styled PDF report
 #     create_html_report   Create an HTML report with charts
 #     list_reports         List all generated reports
+#
+#   SELF-EXTENDING TOOLS:
+#     save_custom_tool     Save reusable analysis code to database
+#     run_custom_tool      Load and run a previously saved tool
+#     list_custom_tools    See all saved custom tools
 
 import os
 import io
@@ -219,16 +224,8 @@ async def execute_analysis(python_code: str, query: str = "SELECT 1") -> str:
     if not query.upper().startswith("SELECT"):
         return json.dumps({"error": "Query must start with SELECT"})
 
-    # SAFETY: Block dangerous operations in the code
-    dangerous = [
-        "import os", "import sys", "subprocess", "open(", "exec(", "eval(",
-        "__import__", "shutil", "pathlib", "rmdir", "unlink", "remove(",
-        "system(", "popen(",
-    ]
-    code_lower = python_code.lower()
-    for d in dangerous:
-        if d.lower() in code_lower:
-            return json.dumps({"error": f"Blocked: code contains forbidden operation '{d}'"})
+    # NOTE: All Python operations are allowed (os, subprocess, open, exec, eval, etc.)
+    # Safety boundary is Docker container isolation — code runs in sandboxed subprocess.
 
     # Fetch data from database
     try:
@@ -276,7 +273,7 @@ print(json.dumps(result, default=str))
         result = subprocess.run(
             ["python3", temp_path],
             capture_output=True, text=True,
-            timeout=30,  # kill after 30 seconds
+            timeout=120,  # kill after 120 seconds
         )
 
         if result.returncode != 0:
@@ -292,7 +289,7 @@ print(json.dumps(result, default=str))
         }, indent=2, default=str)
 
     except subprocess.TimeoutExpired:
-        return json.dumps({"error": "Code took too long (30 second limit)"})
+        return json.dumps({"error": "Code took too long (120 second limit)"})
     except json.JSONDecodeError:
         # If output isn't valid JSON, return as raw text
         return json.dumps({
@@ -786,6 +783,241 @@ async def list_reports() -> str:
                 })
 
     return json.dumps({"reports": reports, "total": len(reports)}, indent=2)
+
+
+# ====================================================================
+#  CUSTOM TOOLS — Self-Extending Tool System
+#  Claude can save reusable Python analysis tools to the database
+#  and run them later without rewriting the code.
+# ====================================================================
+
+@mcp.tool(name="save_custom_tool")
+async def save_custom_tool(
+    name: str,
+    description: str,
+    python_code: str,
+    sql_query: str = "SELECT 1",
+) -> str:
+    """Save a reusable Python analysis tool to the database for future use.
+
+    When you write useful analysis code in execute_analysis, save it here
+    so you can reuse it next time without rewriting.
+
+    Args:
+        name: Short unique name for the tool (lowercase, underscores).
+              Example: "revenue_by_product"
+
+        description: What this tool does — be specific so you can find it later.
+                     Example: "Calculate total revenue grouped by product name"
+
+        python_code: The Python code with def analyze(rows): ...
+                     This is the same format as execute_analysis.
+                     Example:
+                       def analyze(rows):
+                           products = {}
+                           for r in rows:
+                               name = r['product_name']
+                               rev = float(r['price']) * int(r['quantity'])
+                               products[name] = products.get(name, 0) + rev
+                           return dict(sorted(products.items(), key=lambda x: x[1], reverse=True))
+
+        sql_query: The SQL query that fetches data for this tool.
+                   Example: SELECT o.quantity, p.price, p.name as product_name FROM orders o JOIN products p ON o.product_id = p.id
+    """
+    # Clean the name
+    safe_name = "".join(c if c.isalnum() or c == "_" else "_" for c in name.lower())
+    safe_name = safe_name.strip("_")
+    if not safe_name:
+        return json.dumps({"error": "Tool name cannot be empty"})
+
+    try:
+        async with db_pool.acquire() as conn:
+            # Check if tool already exists — update it
+            existing = await conn.fetchval(
+                "SELECT id FROM custom_tools WHERE name = $1", safe_name
+            )
+            if existing:
+                await conn.execute(
+                    """UPDATE custom_tools
+                       SET description = $1, python_code = $2, sql_query = $3, created_at = NOW()
+                       WHERE name = $4""",
+                    description, python_code, sql_query, safe_name,
+                )
+                return json.dumps({
+                    "status": "updated",
+                    "name": safe_name,
+                    "message": f"Tool '{safe_name}' updated successfully.",
+                })
+            else:
+                await conn.execute(
+                    """INSERT INTO custom_tools (name, description, python_code, sql_query)
+                       VALUES ($1, $2, $3, $4)""",
+                    safe_name, description, python_code, sql_query,
+                )
+                return json.dumps({
+                    "status": "saved",
+                    "name": safe_name,
+                    "message": f"Tool '{safe_name}' saved! Use run_custom_tool('{safe_name}') to run it.",
+                })
+
+    except Exception as e:
+        return json.dumps({"error": f"Failed to save tool: {str(e)}"})
+
+
+@mcp.tool(name="run_custom_tool")
+async def run_custom_tool(name: str) -> str:
+    """Load and run a previously saved custom tool from the database.
+
+    This retrieves the saved Python code and SQL query, executes the query,
+    and runs the analysis — exactly like execute_analysis but using saved code.
+
+    Args:
+        name: The name of the saved tool to run.
+              Example: "revenue_by_product"
+    """
+    try:
+        async with db_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT python_code, sql_query FROM custom_tools WHERE name = $1", name
+            )
+            if not row:
+                # Try fuzzy search
+                matches = await conn.fetch(
+                    "SELECT name, description FROM custom_tools WHERE name ILIKE $1 OR description ILIKE $1",
+                    f"%{name}%",
+                )
+                if matches:
+                    suggestions = [f"  - {m['name']}: {m['description']}" for m in matches]
+                    return json.dumps({
+                        "error": f"Tool '{name}' not found. Did you mean one of these?",
+                        "suggestions": suggestions,
+                    })
+                return json.dumps({"error": f"Tool '{name}' not found. Use list_custom_tools to see available tools."})
+
+            python_code = row["python_code"]
+            sql_query = row["sql_query"]
+
+            # Update usage stats
+            await conn.execute(
+                "UPDATE custom_tools SET last_used_at = NOW(), use_count = use_count + 1 WHERE name = $1",
+                name,
+            )
+
+    except Exception as e:
+        return json.dumps({"error": f"Failed to load tool: {str(e)}"})
+
+    # Now run it — same logic as execute_analysis
+    sql_query = sql_query.strip()
+    if not sql_query.upper().startswith("SELECT"):
+        return json.dumps({"error": "Saved query must start with SELECT"})
+
+    # Fetch data
+    try:
+        async with db_pool.acquire() as conn:
+            async with conn.transaction(readonly=True):
+                rows = await conn.fetch(sql_query)
+        data = [dict(row) for row in rows]
+    except Exception as e:
+        return json.dumps({"error": f"Query failed: {str(e)}"})
+
+    # Build execution script
+    script = f"""
+import json
+from datetime import datetime, date
+from decimal import Decimal
+
+def make_serializable(obj):
+    if isinstance(obj, (datetime, date)):
+        return obj.isoformat()
+    if isinstance(obj, Decimal):
+        return float(obj)
+    return obj
+
+def clean_rows(rows):
+    return [{{k: make_serializable(v) for k, v in r.items()}} for r in rows]
+
+# Saved tool code
+{python_code}
+
+# Run it
+rows = json.loads('''{json.dumps(data, default=str)}''')
+rows = clean_rows(rows)
+result = analyze(rows)
+print(json.dumps(result, default=str))
+"""
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+        f.write(script)
+        f.flush()
+        temp_path = f.name
+
+    try:
+        result = subprocess.run(
+            ["python3", temp_path],
+            capture_output=True, text=True,
+            timeout=120,
+        )
+
+        if result.returncode != 0:
+            return json.dumps({
+                "error": "Saved tool execution failed",
+                "tool_name": name,
+                "stderr": result.stderr[:1000],
+            })
+
+        return json.dumps({
+            "status": "success",
+            "tool_name": name,
+            "result": json.loads(result.stdout),
+            "rows_processed": len(data),
+        }, indent=2, default=str)
+
+    except subprocess.TimeoutExpired:
+        return json.dumps({"error": f"Tool '{name}' took too long (120 second limit)"})
+    except json.JSONDecodeError:
+        return json.dumps({
+            "status": "success",
+            "tool_name": name,
+            "result_text": result.stdout[:2000],
+            "rows_processed": len(data),
+        })
+    finally:
+        os.unlink(temp_path)
+
+
+@mcp.tool(name="list_custom_tools")
+async def list_custom_tools() -> str:
+    """List all saved custom tools from the database.
+
+    Returns:
+        JSON array of saved tools with name, description, usage stats.
+    """
+    try:
+        async with db_pool.acquire() as conn:
+            rows = await conn.fetch(
+                """SELECT name, description, sql_query, created_at, last_used_at, use_count
+                   FROM custom_tools ORDER BY use_count DESC, created_at DESC"""
+            )
+
+        tools = []
+        for row in rows:
+            tools.append({
+                "name": row["name"],
+                "description": row["description"],
+                "sql_query": row["sql_query"][:100] + "..." if len(row["sql_query"]) > 100 else row["sql_query"],
+                "created": row["created_at"].isoformat() if row["created_at"] else None,
+                "last_used": row["last_used_at"].isoformat() if row["last_used_at"] else "never",
+                "use_count": row["use_count"],
+            })
+
+        return json.dumps({
+            "tools": tools,
+            "total": len(tools),
+            "tip": "Use run_custom_tool('name') to run any saved tool.",
+        }, indent=2, default=str)
+
+    except Exception as e:
+        return json.dumps({"error": f"Failed to list tools: {str(e)}"})
 
 
 # ====================================================================

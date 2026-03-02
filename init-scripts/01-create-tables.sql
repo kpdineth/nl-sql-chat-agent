@@ -79,3 +79,18 @@ CREATE TABLE saved_visualizations (
 
 GRANT SELECT, INSERT ON saved_visualizations TO readonly_user;
 GRANT USAGE ON SEQUENCE saved_visualizations_id_seq TO readonly_user;
+
+-- Custom tools table — Claude saves reusable Python analysis tools here
+CREATE TABLE custom_tools (
+    id SERIAL PRIMARY KEY,
+    name VARCHAR(100) UNIQUE NOT NULL,
+    description TEXT NOT NULL,
+    python_code TEXT NOT NULL,
+    sql_query TEXT DEFAULT 'SELECT 1',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    last_used_at TIMESTAMP,
+    use_count INTEGER DEFAULT 0
+);
+
+GRANT SELECT, INSERT, UPDATE ON custom_tools TO readonly_user;
+GRANT USAGE ON SEQUENCE custom_tools_id_seq TO readonly_user;
